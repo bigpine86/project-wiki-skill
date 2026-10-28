@@ -26,7 +26,7 @@
 - 위키 저장소의 `scripts/run_personal_mcp.sh`, 빌드된 `bin/personal_mcp`, 비공개 `data/personal_mcp.json`.
 - MCP가 제공하는 `wiki_search`, `wiki_read`, `wiki_save`, `wiki_history`, `wiki_backlinks`와 리비전 검사 계약. 중앙 사용량은 `wiki_usage_sync`, `wiki_usage_read`도 필요하다. 서버와 어댑터를 함께 업데이트한다.
 
-현재 연결 대상은 [원본 개인 위키](https://github.com/bigpine86/namuwiki_261020)의 MCP 구현이다. 일반 openNAMU에 공식 MCP가 내장되어 있다고 가정하지 않는다. 현재 어댑터는 숫자 loopback HTTP 주소만 허용한다. 검증 환경은 macOS이며 위키 연결에는 기존 셸 실행 스크립트를 사용한다.
+현재 연결 대상은 [원본 개인 위키](https://github.com/bigpine86/namuwiki_261020)의 MCP 구현이다. 원본 저장소는 비공개이며, 이 배포본에는 MCP 서버 구현이 없다. 외부 사용자는 위 계약을 만족하는 서버를 별도로 준비해야 한다. 일반 openNAMU에 공식 MCP가 내장되어 있다고 가정하지 않는다. 현재 어댑터는 숫자 loopback HTTP 주소만 허용한다. 검증 환경은 macOS이며 위키 연결에는 기존 셸 실행 스크립트를 사용한다.
 
 ## 설치와 사용
 
@@ -81,6 +81,7 @@ python3 scripts/project_wiki.py --repo /path/to/development-project usage \
 - 사용량은 관측된 부분 합계다. 전체 청구액이나 구독 한도를 나타내지 않는다. 세션별 경계를 사용하며 구간 중첩·경계 초과 요청은 귀속 미확인으로 남긴다.
 - 중앙 DB 중복 검사·원장 조회·기간 집계는 제공한다. 원격 연결 자동 설정, ADR 자동 채번, 문서 이동·이력 병합은 제공하지 않는다.
 - 전체 대화·내부 추론·인증 정보는 이 저장소와 사용량 원장에 넣지 않는다.
+- 글을 생성할 때 선택된 대화 발췌와 개발 근거를 Codex CLI에 전달하고, 결과를 설정한 위키에 저장한다. 비밀을 자동으로 모두 제거하는 기능은 없다. 기록할 근거에 인증 정보가 없는지 확인하고, 비공개 개발 내용은 비공개 위키에 연결한다.
 
 [중앙 저장 설계](docs/USAGE_STORAGE_DESIGN.md)는 현재 서버 계약과 구현 범위를 설명한다. 일상 기록마다 읽는 지침이 아니다.
 
