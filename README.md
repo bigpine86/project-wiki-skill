@@ -14,7 +14,7 @@
 | [scripts/devlog_wiki.py](scripts/devlog_wiki.py) | 커밋·Entire 근거 수집, 모델 호출, post-commit 연결 |
 | [scripts/wiki_usage.py](scripts/wiki_usage.py) | Codex 관측 사용량 수집·중복 제거·집계 |
 | [scripts/backup_local.py](scripts/backup_local.py) | 편집 상태 복원과 위키 저장소용 비공개 백업 |
-| [test](test/) | 외부 모델·네트워크 없이 실행하는 51개 검사 |
+| [test](test/) | 외부 모델·네트워크 없이 실행하는 55개 검사 |
 
 이 저장소는 스킬과 실행기 배포본이다. openNAMU 서버·MCP 서버·위키 데이터는 별도로 준비한다. 복제만으로 Git 훅을 설치하거나 위키를 수정하지 않는다.
 

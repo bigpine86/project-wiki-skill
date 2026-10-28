@@ -2,6 +2,7 @@
 import datetime
 import hashlib
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -51,7 +52,12 @@ def Events(lines, session_id, repo):
             payload = item.get('payload', {})
             if not isinstance(payload, dict):
                 continue
-            timestamp = devlog.Timestamp(item.get('timestamp'))
+            raw_time = item.get('timestamp')
+            if isinstance(raw_time, bool):
+                raise ValueError('invalid event time')
+            timestamp = devlog.Timestamp(raw_time)
+            if not math.isfinite(timestamp) or not 0 < timestamp < 253402300799:
+                raise ValueError('invalid event time')
         except (ValueError, TypeError, AttributeError):
             issues.add('malformed_event')
             continue
@@ -59,6 +65,13 @@ def Events(lines, session_id, repo):
         if kind == 'session_meta':
             matched = payload.get('id', payload.get('session_id')) == session_id
         turn_id = payload.get('turn_id')
+        if turn_id is not None and not isinstance(turn_id, str):
+            issues.add('malformed_event')
+            continue
+        if kind == 'turn_context' and payload.get('model') is not None and not isinstance(payload['model'], str):
+            turns.pop(turn_id, None)
+            issues.add('malformed_event')
+            continue
         if kind == 'event_msg' and payload.get('type') == 'task_started' and turn_id:
             turns.setdefault(turn_id, {})['started_at'] = timestamp
         if kind == 'turn_context' and turn_id:
@@ -139,7 +152,7 @@ def Collect(repo, record, now=None):
         return
     if not sessions:
         devlog.Write_json(root/'observations'/(record['commit']+'.json'),
-                         {'commit': record['commit'], 'status': 'partial', 'issues': ['linked_session_unavailable']})
+                         {'commit': record['commit'], 'checked_at': time.time(), 'status': 'partial', 'issues': ['linked_session_unavailable']})
         return
     cutoff = record.get('observed_at') or devlog.Timestamp(devlog.Git(repo, 'show', '-s', '--format=%cI', record['commit']))+1
     window_path = root/'windows'/(record['commit']+'.json')
@@ -194,7 +207,7 @@ def Collect(repo, record, now=None):
     if any(Window_start(window, sid) is None for sid in sessions):
         issues.append('interval_start_unavailable')
     devlog.Write_json(root/'observations'/(record['commit']+'.json'),
-                     {'commit': record['commit'], 'checked_at': upper, 'status': 'partial', 'issues': sorted(set(issues))})
+                     {'commit': record['commit'], 'checked_at': time.time(), 'status': 'partial', 'issues': sorted(set(issues))})
 
 
 def Cli_usage(path, repo, owner, date, invocation, occurred_at, outcome='unknown', mode='unknown', attempt=None):

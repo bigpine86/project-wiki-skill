@@ -318,3 +318,61 @@ class Usage_tests(unittest.TestCase):
             editor.Process(self.repo, fixture.path, config)
             self.assertEqual(1, generate.call_count)
             self.assertEqual('done', json.loads(fixture.path.read_text())['state'])
+
+    def test_collection_check_time_advances_without_expanding_commit_window(self):
+        with mock.patch.object(usage.time, 'time', return_value=250):
+            first = self.Collect(self.Lines()+self.Lines('later', 210, 220))
+        self.assertEqual(250, first['observations'][0]['checked_at'])
+        self.assertEqual(1, len(first['events']))
+        with mock.patch.object(usage.time, 'time', return_value=300):
+            second = self.Collect(self.Lines())
+        self.assertEqual(300, second['observations'][0]['checked_at'])
+        self.assertEqual(200, json.loads((self.root/'windows'/(self.sha+'.json')).read_text())['before'])
+        with mock.patch.object(usage.time, 'time', return_value=350):
+            usage.Collect(self.repo, dict(self.record, session_id=None))
+        observation = usage.Report(self.repo)['observations'][0]
+        self.assertEqual(350, observation['checked_at'])
+        self.assertEqual(['linked_session_unavailable'], observation['issues'])
+
+    def test_central_read_does_not_require_local_usage_files(self):
+        import contextlib
+        import io
+        config = dict(self.fixture.config, usage_central=True)
+        result = {'storage':'central','revision':'7','totals':{}}
+        with mock.patch.object(sys, 'argv', ['project_wiki.py', '--repo', str(self.repo), 'usage', '--central']), \
+             mock.patch.object(editor.devlog, 'Load_config', return_value=config), \
+             mock.patch.object(editor.devlog, 'Mcp', return_value=self.fixture.wiki), \
+             mock.patch.object(usage, 'Central_report', return_value=result), \
+             mock.patch.object(usage, 'Report', side_effect=RuntimeError('broken local ledger')) as local, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            editor.Main()
+        local.assert_not_called()
+        self.assertEqual(result, json.loads(output.getvalue()))
+
+    def test_central_read_rejects_mutating_flags(self):
+        for extra in (['--sync'], ['--refresh'], ['--apply', '--date', '2026-10-29']):
+            with self.subTest(extra=extra), \
+                 mock.patch.object(sys, 'argv', ['project_wiki.py', '--repo', str(self.repo), 'usage', '--central']+extra), \
+                 mock.patch.object(editor.devlog, 'Load_config', return_value=self.fixture.config), \
+                 mock.patch.object(editor.devlog, 'Mcp') as client, \
+                 mock.patch.object(usage, 'Collect') as collect, \
+                 self.assertRaisesRegex(RuntimeError, 'read-only'):
+                editor.Main()
+            client.assert_not_called()
+            collect.assert_not_called()
+
+    def test_malformed_metadata_does_not_block_valid_requests(self):
+        invalid = self.Lines('bad')
+        invalid[1]['payload']['turn_id'] = ['invalid']
+        invalid[2]['payload']['model'] = {'invalid': 'model'}
+        invalid[-1]['payload']['turn_id'] = ['invalid']
+        raw = [json.dumps(line) for line in invalid+self.Lines('valid')]
+        events, issues = usage.Events(raw, self.sid, self.repo)
+        self.assertEqual(['codex:valid'], [event['id'] for event in events])
+        self.assertIn('malformed_event', issues)
+        for value in (float('nan'), float('inf'), True):
+            lines = self.Lines('bad-time')
+            lines[-1]['timestamp'] = value
+            events, issues = usage.Events([json.dumps(line) for line in lines], self.sid, self.repo)
+            self.assertFalse(events)
+            self.assertIn('malformed_event', issues)

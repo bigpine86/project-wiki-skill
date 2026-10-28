@@ -762,6 +762,8 @@ def Main():
     if config.get('mode') != 'project' and args.action not in ('status', 'usage'):
         raise RuntimeError('install project mode first')
     if args.action == 'usage':
+        if args.central and (args.sync or args.refresh or args.apply):
+            raise RuntimeError('usage --central is read-only; use --sync or --apply separately')
         if args.apply and (not args.date or config.get('mode') != 'project'):
             raise RuntimeError('usage --apply requires --date and project mode')
         if args.refresh:
@@ -773,7 +775,6 @@ def Main():
                     if record.get('commit') and any(s and s not in seen for s in sessions):
                         wiki_usage.Collect(repo, record, now=datetime.datetime.now().timestamp())
                         seen.update(sessions)
-        report = wiki_usage.Report(repo)
         if args.sync or args.central:
             client = devlog.Mcp(config)
             try:
@@ -784,6 +785,8 @@ def Main():
                         devlog.Write_json(devlog.State(repo)/'config.json', config)
             finally:
                 client.Close()
+        else:
+            report = wiki_usage.Report(repo)
         if args.apply:
             report['publication'] = Publish_usage(repo, config, args.date)
         print(json.dumps(report, ensure_ascii=False, indent=2))
