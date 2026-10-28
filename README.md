@@ -13,7 +13,8 @@
 | [scripts/project_wiki.py](scripts/project_wiki.py) | 문서 조회·계획·검증·관리 문단 저장 |
 | [scripts/devlog_wiki.py](scripts/devlog_wiki.py) | 커밋·Entire 근거 수집, 모델 호출, post-commit 연결 |
 | [scripts/wiki_usage.py](scripts/wiki_usage.py) | Codex 관측 사용량 수집·중복 제거·집계 |
-| [test](test/) | 외부 모델·네트워크 없이 실행하는 45개 검사 |
+| [scripts/backup_local.py](scripts/backup_local.py) | 편집 상태 복원과 위키 저장소용 비공개 백업 |
+| [test](test/) | 외부 모델·네트워크 없이 실행하는 51개 검사 |
 
 이 저장소는 스킬과 실행기 배포본이다. openNAMU 서버·MCP 서버·위키 데이터는 별도로 준비한다. 복제만으로 Git 훅을 설치하거나 위키를 수정하지 않는다.
 
@@ -23,7 +24,7 @@
 - 연결 대화 수집에 사용할 Entire CLI. 요청별 사용량은 연결된 Codex 로컬 로그에서 관측한다.
 - 개인 MCP 브리지가 설치된 openNAMU 저장소와 실행 중인 위키.
 - 위키 저장소의 `scripts/run_personal_mcp.sh`, 빌드된 `bin/personal_mcp`, 비공개 `data/personal_mcp.json`.
-- MCP가 제공하는 `wiki_search`, `wiki_read`, `wiki_save`, `wiki_history`, `wiki_backlinks`와 리비전 검사 계약.
+- MCP가 제공하는 `wiki_search`, `wiki_read`, `wiki_save`, `wiki_history`, `wiki_backlinks`와 리비전 검사 계약. 중앙 사용량은 `wiki_usage_sync`, `wiki_usage_read`도 필요하다. 서버와 어댑터를 함께 업데이트한다.
 
 현재 연결 대상은 [원본 개인 위키](https://github.com/bigpine86/namuwiki_261020)의 MCP 구현이다. 일반 openNAMU에 공식 MCP가 내장되어 있다고 가정하지 않는다. 현재 어댑터는 숫자 loopback HTTP 주소만 허용한다. 검증 환경은 macOS이며 위키 연결에는 기존 셸 실행 스크립트를 사용한다.
 
@@ -65,21 +66,23 @@ python3 scripts/project_wiki.py --repo /path/to/development-project record \
 
 ```sh
 python3 scripts/project_wiki.py --repo /path/to/development-project usage
+python3 scripts/project_wiki.py --repo /path/to/development-project usage --refresh --sync
+python3 scripts/project_wiki.py --repo /path/to/development-project usage --central
 python3 scripts/project_wiki.py --repo /path/to/development-project usage \
   --refresh --date 2026-10-29 --apply
 ```
 
-더 필요한 작업에만 [실행 안내](.agents/skills/project-wiki/references/integration.md) 또는 [사용량 기준](.agents/skills/project-wiki/references/usage-recording.md)을 읽는다. 운영 위키의 등록 설정은 이 배포 과정에서 바꾸지 않았다.
+더 필요한 작업에만 [실행 안내](.agents/skills/project-wiki/references/integration.md) 또는 [사용량 기준](.agents/skills/project-wiki/references/usage-recording.md)을 읽는다. `usage --sync`가 성공하면 해당 프로젝트의 자동 중앙 동기화를 활성화한다. 개요·일지에서 사용량 상세 화면으로 연결한다. 여러 PC는 같은 서버로 제출한 요청 ID를 한 번만 집계하지만 원격 접속 설정은 별도로 준비한다.
 
 ## 보존과 현재 한계
 
 - 사람의 문장과 기존 근거를 보존한다. 자동 관리 문단에 사람 수정이 있으면 덮어쓰지 않고 검토 대상으로 남긴다.
-- 원장·대기 입력·편집 기준은 대상 개발 저장소의 Git 관리 폴더 `devlog-wiki/`에 있다. 소스 푸시로 백업되지 않는다. 위키 DB와 이 상태를 각각 비공개 백업한다.
-- 사용량은 관측된 부분 합계다. 전체 청구액이나 구독 한도를 나타내지 않는다. 여러 세션의 경계가 다를 때 귀속이 미확인으로 남는 알려진 제한이 있다.
-- 여러 PC 원장 병합, 중앙 DB 원장, ADR 자동 채번, 문서 이동·이력 병합은 제공하지 않는다.
+- 원장·대기 입력·편집 기준은 대상 개발 저장소의 Git 관리 폴더 `devlog-wiki/`에 있다. 소스 푸시로 백업되지 않는다. 위키 DB와 이 상태를 같은 시점에 비공개 백업한다. 서버와 편집 작업을 멈추고 **위키 저장소의** `scripts/backup_local.py --state-repo /path/to/development-project`를 실행한다. 이 배포본에는 DB가 없으므로 전체 위키 백업은 여기서 실행하지 않는다. 상태 복원은 이 배포본의 `scripts/backup_local.py --restore-state <백업/devlog-wiki-N> --repo <대상>`으로도 가능하다. 빈 대상과 해시 검증을 요구한다.
+- 사용량은 관측된 부분 합계다. 전체 청구액이나 구독 한도를 나타내지 않는다. 세션별 경계를 사용하며 구간 중첩·경계 초과 요청은 귀속 미확인으로 남긴다.
+- 중앙 DB 중복 검사·원장 조회·기간 집계는 제공한다. 원격 연결 자동 설정, ADR 자동 채번, 문서 이동·이력 병합은 제공하지 않는다.
 - 전체 대화·내부 추론·인증 정보는 이 저장소와 사용량 원장에 넣지 않는다.
 
-[중앙 저장 설계](docs/USAGE_STORAGE_DESIGN.md)는 다음 단계 제안이다. 일상 기록마다 읽는 지침이 아니다.
+[중앙 저장 설계](docs/USAGE_STORAGE_DESIGN.md)는 현재 서버 계약과 구현 범위를 설명한다. 일상 기록마다 읽는 지침이 아니다.
 
 ## 검증
 

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from zoneinfo import ZoneInfo
 
 SCRIPT = Path(__file__).resolve()
@@ -87,8 +88,8 @@ class Mcp:
             raise RuntimeError('wiki MCP protocol error')
         return response['result']
 
-    def Call(self, name, **args):
-        result = self.Rpc('tools/call', {'name': name, 'arguments': args})
+    def Call(self, tool_name, **args):
+        result = self.Rpc('tools/call', {'name': tool_name, 'arguments': args})
         return result['structuredContent']
 
     def Close(self):
@@ -296,19 +297,27 @@ def Model_json(prompt, schema_value, config, state, usage_context=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith(('NAMU_MCP_', 'CODEX_THREAD_', 'CODEX_SESSION_', 'GIT_'))}
         env['DEVLOG_WIKI_GENERATING'] = '1'
         stream = temp/'events.jsonl'
+        invocation = uuid.uuid4().hex
+        outcome = 'failed'
         try:
             with stream.open('w') as log:
                 os.chmod(stream, 0o600)
                 result = subprocess.run(args, input=prompt, cwd=temp, env=env, text=True,
                                         stdout=log, stderr=subprocess.DEVNULL, timeout=300)
+            if result.returncode or not output.exists():
+                raise RuntimeError('Codex devlog generation failed; check Codex sign-in/usage and retry')
+            generated = json.loads(output.read_text())
+            outcome = 'completed'
+        except subprocess.TimeoutExpired:
+            outcome = 'timeout'
+            raise
         finally:
             if usage_context:
                 import wiki_usage
                 wiki_usage.Cli_usage(stream, usage_context['repo'], usage_context['owner'],
-                                     usage_context['date'], temp.name, time.time())
-        if result.returncode or not output.exists():
-            raise RuntimeError('Codex devlog generation failed; check Codex sign-in/usage and retry')
-        return json.loads(output.read_text())
+                                     usage_context['date'], invocation, time.time(), outcome,
+                                     usage_context.get('mode', 'unknown'), usage_context.get('attempt'))
+        return generated
 
 
 def Plain(text):

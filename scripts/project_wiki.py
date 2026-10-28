@@ -129,8 +129,11 @@ def Render(edit, record, config, prior):
     start, end = Markers(config, edit['key'])
     if edit['role'] == 'usage':
         body = '== AI 사용량 ==\n'+devlog.Plain(edit['text'])+'\n'
-        body += '\n{{{#!folding 커밋별 사용량 근거\n'
-        body += '\n'.join(' * '+devlog.Plain(line) for line in edit['usage_details'])+'\n}}}\n'
+        if edit.get('usage_url'):
+            body += '\n[['+edit['usage_url']+'|AI 사용량 상세]]\n'
+        if edit['usage_details']:
+            body += '\n{{{#!folding 커밋별 사용량 근거\n'
+            body += '\n'.join(' * '+devlog.Plain(line) for line in edit['usage_details'])+'\n}}}\n'
         return start+body+end, [], []
     provenance = list(prior.get('provenance', []))
     entry = '기록: '+Identity(record, config)
@@ -317,7 +320,7 @@ def Generate(context, record, config, state):
                                       Schema(), config, state, usage_context=usage_context), context, config)
 
 
-def Prepare(plan, context, record, config, journal, client, usage_only=False):
+def Prepare(plan, context, record, config, journal, client, usage_only=False, usage_report=None):
     """Turn a validated editorial plan into exact, durable range edits."""
     operations, deferred = [], list(plan['deferred'])
     baseline = journal.setdefault('blocks', {})
@@ -336,10 +339,17 @@ def Prepare(plan, context, record, config, journal, client, usage_only=False):
                'text': '이 날짜의 작업에 연결된 커밋과 대화 자료입니다.', 'links': [], 'evidence': []}
     extras = [] if usage_only else [receipt]
     if record.get('usage_context'):
-        report = wiki_usage.Report(Path(record['usage_context']['repo']))
+        report = usage_report if usage_report is not None else (wiki_usage.Sync(Path(record['usage_context']['repo']), config, client)
+                  if config.get('usage_central') and not record['usage_context'].get('preview')
+                  else wiki_usage.Report(Path(record['usage_context']['repo'])))
         text, details = wiki_usage.Daily_summary(report, record['date'])
         extras.append({'title': context['daily'], 'role': 'usage', 'key': 'ai-usage',
-                       'heading': 'AI 사용량', 'text': text, 'links': [], 'evidence': [], 'usage_details': details})
+                       'heading': 'AI 사용량', 'text': text, 'links': [], 'evidence': [], 'usage_details': details,
+                       'usage_url': wiki_usage.Usage_url(config) if report.get('storage') == 'central' else None})
+        if report.get('storage') == 'central' and config['overview'] in context['pages']:
+            extras.append({'title': config['overview'], 'role': 'usage', 'key': 'ai-usage',
+                           'heading': 'AI 사용량', 'text': '기간·모델·커밋별 관측 사용량과 수집 상태를 조회한다.',
+                           'links': [], 'evidence': [], 'usage_details': [], 'usage_url': wiki_usage.Usage_url(config)})
     for edit in plan['edits']+extras:
         title, key = edit['title'], edit['key']
         slot = title+'\n'+key
@@ -509,14 +519,24 @@ def Process(repo, path, config, preview=False):
             journal = Read_json(journal_path, {'blocks': {}})
             wiki_usage.Collect(repo, record)
             record['usage_context'] = {'repo': str(repo), 'owner': record.get('commit') or record.get('event_id'),
-                                       'date': record['date']}
+                                       'date': record['date'], 'mode': 'preview' if preview else 'apply',
+                                       'attempt': record.get('attempts', 0)+1, 'preview': preview}
+            usage_report = None
             if 'operations' not in record or preview:
-                context = Context(repo, record, config, client)
+                context = record.get('planning_context') if not preview else None
+                context = context or Context(repo, record, config, client)
                 if not preview:
                     record['attempts'] = record.get('attempts', 0)+1
                     devlog.Write_json(path, record)
-                plan = Generate(context, record, config, path.parent)
-                operations, deferred = Prepare(plan, context, record, config, journal, client)
+                plan = record.get('generated_plan') if not preview else None
+                if plan is None:
+                    plan = Generate(context, record, config, path.parent)
+                    if not preview:
+                        record.update(generated_plan=plan, planning_context=context)
+                        devlog.Write_json(path, record)
+                usage_report = (wiki_usage.Sync(repo, config, client) if config.get('usage_central') and not preview
+                                else wiki_usage.Report(repo))
+                operations, deferred = Prepare(plan, context, record, config, journal, client, usage_report=usage_report)
                 if preview:
                     report = {'deferred': deferred, 'changes': []}
                     for op in operations:
@@ -533,11 +553,17 @@ def Process(repo, path, config, preview=False):
             Navigation(record, path, config, journal, journal_path, client)
             Apply(record, path, config, journal, journal_path, client, repo)
             Index(record, config, client)
-            deferred = record.get('deferred', []) + [op['error'] for op in record['operations'] if op['state'] == 'deferred']
+            refreshed = []
+            if config.get('usage_central'):
+                usage_report = usage_report if usage_report is not None else wiki_usage.Sync(repo, config, client)
+                refreshed = Refresh_usage(repo, config, record['date'], client, journal, usage_report)['deferred']
+            deferred = refreshed + record.get('deferred', []) + [op['error'] for op in record['operations'] if op['state'] == 'deferred']
             record.update(state='review' if deferred else 'done', deferred=deferred,
                           title=Daily(record, config), error=None)
             if not deferred:
                 record.pop('sources', None)
+                record.pop('generated_plan', None)
+                record.pop('planning_context', None)
             devlog.Write_json(path, record)
     except Exception as error:
         if str(error) == 'project editor busy; input remains pending':
@@ -630,27 +656,58 @@ def Manual(repo, config, args):
     return path
 
 
+def Refresh_usage(repo, config, date, client, journal, report):
+    """Refresh changed managed summaries only. Reuse durable operations after a lost response."""
+    dates = {date}
+    prefix = '개발 기록/'
+    suffix = '/'+config['project']+'\nai-usage'
+    for slot in journal.get('blocks', {}):
+        if slot.startswith(prefix) and slot.endswith(suffix):
+            candidate = slot[len(prefix):-len(suffix)]
+            if re.fullmatch(r'\d{4}-\d{2}-\d{2}', candidate):
+                dates.add(candidate)
+    deferred = []
+    journal_path = Journal_path(repo)
+    for day in sorted(dates):
+        record = {'event_id': 'usage-refresh-'+day, 'date': day, 'captured': True,
+                  'usage_context': {'repo': str(repo)}, 'state': 'pending'}
+        title = Daily(record, config)
+        path = devlog.State(repo)/'records'/('usage-refresh-'+day+'.json')
+        prior = Read_json(path, {})
+        if prior.get('state') == 'pending' and prior.get('operations'):
+            Apply(prior, path, config, journal, journal_path, client, repo)
+        text, details = wiki_usage.Daily_summary(report, day)
+        edit = {'role': 'usage', 'key': 'ai-usage', 'heading': 'AI 사용량', 'text': text,
+                'links': [], 'evidence': [], 'usage_details': details,
+                'usage_url': wiki_usage.Usage_url(config) if report.get('storage') == 'central' else None}
+        baseline = journal.get('blocks', {}).get(title+'\nai-usage', {})
+        # Compare locally first: unchanged historical days require no wiki reads/writes.
+        if day != date and baseline.get('content') == Render(edit, record, config, baseline)[0]:
+            continue
+        pages = {}
+        for name in (title, config['overview']):
+            content, revision = devlog.Read(client, name)
+            pages[name] = {'content': content, 'revision': revision}
+        operations, problems = Prepare({'edits': [], 'deferred': []}, {'daily': title, 'pages': pages},
+                                       record, config, journal, client, usage_only=True, usage_report=report)
+        record.update(operations=operations, deferred=problems)
+        devlog.Write_json(path, record)
+        Apply(record, path, config, journal, journal_path, client, repo)
+        problems += [op.get('error', 'usage update incomplete') for op in operations if op['state'] != 'done']
+        record.update(state='review' if problems else 'done', deferred=problems)
+        devlog.Write_json(path, record)
+        deferred.extend(problems)
+    return {'state': 'review' if deferred else 'done', 'title': Daily({'date': date}, config), 'deferred': deferred}
+
+
 def Publish_usage(repo, config, date):
     datetime.date.fromisoformat(date)
-    record = {'event_id': 'usage-refresh-'+date, 'date': date, 'captured': True,
-              'usage_context': {'repo': str(repo)}, 'state': 'pending'}
     with Lock(repo, config):
         client = devlog.Mcp(config)
         try:
-            title = Daily(record, config)
-            content, revision = devlog.Read(client, title)
-            context = {'daily': title, 'pages': {title: {'content': content, 'revision': revision}}}
-            journal_path = Journal_path(repo)
-            journal = Read_json(journal_path, {'blocks': {}})
-            operations, deferred = Prepare({'edits': [], 'deferred': []}, context, record, config,
-                                           journal, client, usage_only=True)
-            record.update(operations=operations, deferred=deferred)
-            path = devlog.State(repo)/'records'/('usage-refresh-'+date+'.json')
-            devlog.Write_json(path, record)
-            Apply(record, path, config, journal, journal_path, client, repo)
-            record['state'] = 'review' if deferred or any(op['state'] != 'done' for op in operations) else 'done'
-            devlog.Write_json(path, record)
-            return {'state': record['state'], 'title': title, 'deferred': deferred}
+            report = wiki_usage.Sync(repo, config, client) if config.get('usage_central') else wiki_usage.Report(repo)
+            journal = Read_json(Journal_path(repo), {'blocks': {}})
+            return Refresh_usage(repo, config, date, client, journal, report)
         finally:
             client.Close()
 
@@ -684,6 +741,8 @@ def Main():
     sub.add_parser('pause')
     sub.add_parser('resume')
     usage = sub.add_parser('usage', help='numeric-only observed usage report; no model call')
+    usage.add_argument('--sync', action='store_true', help='sync local evidence and enable the central ledger')
+    usage.add_argument('--central', action='store_true', help='read central totals without a model or write')
     usage.add_argument('--refresh', action='store_true', help='read exact sessions linked to existing records')
     usage.add_argument('--date', help='diary date to update with --apply')
     usage.add_argument('--apply', action='store_true', help='save the usage block only')
@@ -715,6 +774,16 @@ def Main():
                         wiki_usage.Collect(repo, record, now=datetime.datetime.now().timestamp())
                         seen.update(sessions)
         report = wiki_usage.Report(repo)
+        if args.sync or args.central:
+            client = devlog.Mcp(config)
+            try:
+                with Lock(repo, config):
+                    report = wiki_usage.Sync(repo, config, client) if args.sync else wiki_usage.Central_report(client, config)
+                    if args.sync:
+                        config['usage_central'] = True
+                        devlog.Write_json(devlog.State(repo)/'config.json', config)
+            finally:
+                client.Close()
         if args.apply:
             report['publication'] = Publish_usage(repo, config, args.date)
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -753,6 +822,8 @@ def Main():
             if not record.get('sources'):
                 raise RuntimeError('original sources unavailable; submit a new explicit record')
             record.pop('operations', None)
+            record.pop('generated_plan', None)
+            record.pop('planning_context', None)
             record.pop('navigation_prepared', None)
         record.update(state='pending', attempts=0)
         devlog.Write_json(path, record)

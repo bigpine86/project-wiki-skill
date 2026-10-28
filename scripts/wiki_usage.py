@@ -3,6 +3,7 @@ import datetime
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 import re
 import uuid
@@ -97,7 +98,7 @@ def Store(root, event):
     target = folder/(Key(event['id'])+'.json')
     if target.exists():
         prior = json.loads(target.read_text())
-        if prior['counters'] == event['counters'] and prior['purpose'] == event['purpose']:
+        if prior == event:
             return
         devlog.Write_json(root/'conflicts'/(Key(event['id'])+'.json'), {'id': event['id']})
         raise RuntimeError('usage event conflict; totals require review')
@@ -108,7 +109,7 @@ def Store(root, event):
             os.link(temporary, target)
         except FileExistsError:
             prior = json.loads(target.read_text())
-            if prior['counters'] != event['counters'] or prior['purpose'] != event['purpose']:
+            if prior != event:
                 devlog.Write_json(root/'conflicts'/(Key(event['id'])+'.json'), {'id': event['id']})
                 raise RuntimeError('usage event conflict; totals require review')
     finally:
@@ -125,6 +126,10 @@ def Find_session(session_id):
     return paths[0] if len(paths) == 1 else None
 
 
+def Window_start(window, session_id):
+    return window.get('session_after', {}).get(session_id, window.get('after'))
+
+
 def Collect(repo, record, now=None):
     """Register a bounded commit window, then refresh only its exact sessions."""
     root = Root(repo)
@@ -138,25 +143,31 @@ def Collect(repo, record, now=None):
         return
     cutoff = record.get('observed_at') or devlog.Timestamp(devlog.Git(repo, 'show', '-s', '--format=%cI', record['commit']))+1
     window_path = root/'windows'/(record['commit']+'.json')
-    if not window_path.exists():
-        bounds = []
-        for path in (devlog.State(repo)/'records').glob('*.json'):
-            prior = json.loads(path.read_text())
-            if prior.get('observed_at', cutoff) < cutoff and prior.get('session_id') in sessions:
-                bounds.append(prior['observed_at'])
-        if bounds:
-            lower = max(bounds)
-        else:
-            try:
-                lower = devlog.Timestamp(devlog.Git(repo, 'show', '-s', '--format=%cI', record['commit']+'^'))
-            except RuntimeError:
-                lower = None
-        if lower is not None and lower >= cutoff:
-            lower = None
-        devlog.Write_json(window_path, {'commit': record['commit'], 'date': record['date'],
-            'sessions': sessions, 'after': lower, 'before': cutoff,
-            'basis': 'observed_commit_window' if bounds else 'parent_commit_time'})
-    window = json.loads(window_path.read_text())
+    window = json.loads(window_path.read_text()) if window_path.exists() else None
+    if window is None or window.get('boundary_version') != 2:
+        records = [json.loads(p.read_text()) for p in (devlog.State(repo)/'records').glob('*.json')]
+        # Preserve the observed end of old windows; repair only their per-session starts.
+        cutoff = window['before'] if window else cutoff
+        sessions = window['sessions'] if window else sessions
+        session_after = {}
+        for sid in sessions:
+            bounds = [prior['observed_at'] for prior in records
+                      if prior.get('commit') != record['commit'] and prior.get('observed_at', cutoff) < cutoff
+                      and sid in (prior.get('usage_sessions') or [prior.get('imported_session') or prior.get('session_id')])]
+            if bounds:
+                lower = max(bounds)
+            elif window and len(sessions) == 1:
+                lower = window['after']
+            else:
+                try:
+                    lower = devlog.Timestamp(devlog.Git(repo, 'show', '-s', '--format=%cI', record['commit']+'^'))
+                except RuntimeError:
+                    lower = None
+            session_after[sid] = lower if lower is not None and lower < cutoff else None
+        window = {'commit': record['commit'], 'date': record['date'], 'sessions': sessions,
+                  'after': None, 'session_after': session_after, 'before': cutoff,
+                  'basis': 'per_session_commit_window', 'boundary_version': 2}
+        devlog.Write_json(window_path, window)
     issues = []
     upper = now if now is not None else cutoff
     for session_id in window['sessions']:
@@ -167,8 +178,8 @@ def Collect(repo, record, now=None):
         with path.open() as stream:
             events, errors = Events(stream, session_id, repo)
         issues.extend(errors)
-        starts = [w['after'] for p in (root/'windows').glob('*.json')
-                  if session_id in (w := json.loads(p.read_text()))['sessions'] and w['after'] is not None]
+        starts = [Window_start(w, session_id) for p in (root/'windows').glob('*.json')
+                  if session_id in (w := json.loads(p.read_text()))['sessions'] and Window_start(w, session_id) is not None]
         lower = min(starts) if starts else None
         for event in events:
             # Never pull a whole historical session into the first commit's total.
@@ -180,13 +191,13 @@ def Collect(repo, record, now=None):
                 issues.append('usage_event_conflict')
     if not sessions:
         issues.append('linked_session_unavailable')
-    if window['after'] is None:
+    if any(Window_start(window, sid) is None for sid in sessions):
         issues.append('interval_start_unavailable')
     devlog.Write_json(root/'observations'/(record['commit']+'.json'),
                      {'commit': record['commit'], 'checked_at': upper, 'status': 'partial', 'issues': sorted(set(issues))})
 
 
-def Cli_usage(path, repo, owner, date, invocation, occurred_at):
+def Cli_usage(path, repo, owner, date, invocation, occurred_at, outcome='unknown', mode='unknown', attempt=None):
     """CLI turn totals do not expose individual API request count or guaranteed model."""
     count = 0
     if path.exists():
@@ -196,7 +207,7 @@ def Cli_usage(path, repo, owner, date, invocation, occurred_at):
                     item = json.loads(line)
                 except ValueError:
                     continue
-                if item.get('type') != 'turn.completed':
+                if not isinstance(item, dict) or item.get('type') != 'turn.completed':
                     continue
                 counters = Counters(item.get('usage'))
                 if counters is None:
@@ -210,25 +221,28 @@ def Cli_usage(path, repo, owner, date, invocation, occurred_at):
     # Missing usage is an observation, never a zero-token event.
     devlog.Write_json(Root(repo)/'calls'/(invocation+'.json'),
                      {'owner': owner, 'date': date, 'occurred_at': occurred_at,
-                      'usage_available': count > 0, 'invocation': invocation})
+                      'usage_available': count > 0, 'invocation': invocation,
+                      'outcome': outcome, 'mode': mode, 'attempt': attempt})
 
 
 def Report(repo):
     root = Root(repo)
     windows = [json.loads(p.read_text()) for p in (root/'windows').glob('*.json')]
-    events = []
-    for path in sorted((root/'events').glob('*.json')):
-        if (root/'conflicts'/path.name).exists():
-            continue
-        event = json.loads(path.read_text())
+    events = [json.loads(p.read_text()) for p in sorted((root/'events').glob('*.json'))
+              if not (root/'conflicts'/p.name).exists()]
+    calls = [json.loads(p.read_text()) for p in (root/'calls').glob('*.json')]
+    observations = [json.loads(p.read_text()) for p in (root/'observations').glob('*.json')]
+    return Summarize(events, windows, calls, observations, len(list((root/'conflicts').glob('*.json'))))
+
+
+def Summarize(events, windows, calls, observations, conflicts):
+    for event in events:
         if event['purpose'] == 'development':
-            eligible = [w for w in windows if event['session_id'] in w['sessions'] and w['after'] is not None
-                        and w['after'] < event['occurred_at'] <= w['before']
-                        and event.get('started_at') is not None and w['after'] < event['started_at'] <= event['occurred_at']]
-            # Multiple overlapping windows are ambiguous, including branches and amended commits.
+            eligible = [w for w in windows if event['session_id'] in w['sessions'] and Window_start(w, event['session_id']) is not None
+                        and Window_start(w, event['session_id']) < event['occurred_at'] <= w['before']
+                        and event.get('started_at') is not None and Window_start(w, event['session_id']) < event['started_at'] <= event['occurred_at']]
             event['owner'] = eligible[0]['commit'] if len(eligible) == 1 else None
             event['date'] = eligible[0]['date'] if len(eligible) == 1 else None
-        events.append(event)
     totals = {}
     for event in events:
         occurred_date = datetime.datetime.fromtimestamp(event['occurred_at'], ZoneInfo('Asia/Seoul')).date().isoformat()
@@ -250,11 +264,77 @@ def Report(repo):
                 bucket['requests'] = (bucket['requests'] or 0)+event['requests']
             else:
                 bucket['requests'] = None
-    calls = [json.loads(p.read_text()) for p in (root/'calls').glob('*.json')]
-    observations = [json.loads(p.read_text()) for p in (root/'observations').glob('*.json')]
     return {'status': 'partial', 'timezone': 'Asia/Seoul', 'totals': totals, 'events': events,
             'calls': calls, 'observations': observations,
-            'conflicts': len(list((root/'conflicts').glob('*.json')))}
+            'conflicts': conflicts}
+
+
+def Central_report(client, config):
+    for attempt in range(3):
+        records, cursor, revision = [], '', None
+        while True:
+            result = client.Call('wiki_usage_read', project_id=config['project_id'], cursor=cursor)
+            if result.get('response') != 'ok':
+                raise RuntimeError('central usage read failed; local ledger preserved')
+            if revision is not None and revision != result['revision']:
+                break
+            revision = result['revision']
+            records.extend(result['records'])
+            cursor = result['cursor']
+            if not cursor:
+                conflicts = {r['payload']['id'] for r in records if r['kind'] == 'conflict'}
+                conflicts.update(r['payload']['id'] for r in records if r.get('conflict') and r['kind'] == 'event')
+                good = [r for r in records if not r.get('conflict')]
+                events = [r['payload'] for r in good if r['kind'] == 'event' and r['payload']['id'] not in conflicts]
+                report = Summarize(events, [r['payload'] for r in good if r['kind'] == 'window'],
+                                   [r['payload'] for r in good if r['kind'] == 'call'],
+                                   [r['payload'] for r in good if r['kind'] == 'observation'],
+                                   len(conflicts)+sum(bool(r.get('conflict')) for r in records if r['kind'] != 'event'))
+                report.update(storage='central', revision=revision)
+                return report
+    raise RuntimeError('central usage changed during read; retry')
+
+
+def Sync(repo, config, client):
+    """Resend immutable evidence. The server owns deduplication and canonical totals."""
+    root = Root(repo)
+    state_path = root/'sync.json'
+    try:
+        # Session boundaries can be repaired from existing input records, without a model.
+        for path in (devlog.State(repo)/'records').glob('*.json'):
+            record = json.loads(path.read_text())
+            if record.get('commit') and (root/'windows'/(record['commit']+'.json')).exists():
+                window = json.loads((root/'windows'/(record['commit']+'.json')).read_text())
+                if window.get('boundary_version') != 2:
+                    Collect(repo, record)
+        batch = []
+        for folder, kind in [('events','event'), ('windows','window'), ('calls','call'),
+                             ('observations','observation'), ('conflicts','conflict')]:
+            for path in sorted((root/folder).glob('*.json')):
+                batch.append({'kind': kind, 'payload': json.loads(path.read_text())})
+        # Always register/check the binding, including an empty ledger.
+        for offset in range(0, max(1, len(batch)), 100):
+            result = client.Call('wiki_usage_sync', project_id=config['project_id'], overview=config['overview'],
+                                 name=config['project'], records=batch[offset:offset+100])
+            if result.get('response') != 'ok':
+                raise RuntimeError('central usage sync failed; local ledger preserved')
+        report = Central_report(client, config)
+        devlog.Write_json(state_path, {'state':'done', 'checked_at':time.time(), 'revision':report['revision']})
+        return report
+    except Exception:
+        devlog.Write_json(state_path, {'state':'pending', 'checked_at':time.time()})
+        raise
+
+
+def Usage_url(config):
+    # Match the MCP client's existing local-only URL contract.
+    import ipaddress
+    from urllib.parse import urlsplit
+    value = os.environ.get('NAMU_MCP_URL', 'http://127.0.0.1:3000').rstrip('/')
+    parsed = urlsplit(value)
+    if parsed.scheme != 'http' or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment or not ipaddress.ip_address(parsed.hostname).is_loopback:
+        raise RuntimeError('invalid local wiki URL')
+    return value+'/personal_usage/'+config['project_id']
 
 
 def Daily_summary(report, date):
