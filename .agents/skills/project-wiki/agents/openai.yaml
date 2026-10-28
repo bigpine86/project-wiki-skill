@@ -1,0 +1,4 @@
+interface:
+  display_name: "프로젝트 위키"
+  short_description: "프로젝트의 첫 소개부터 개발 일지·방향 전환·문서 개편까지 정리합니다"
+  default_prompt: "$project-wiki로 프로젝트 단계와 기존 문서를 확인하고, 이번 작업과 선택 이유를 알맞은 소개·일지·결정에 반영해줘."
